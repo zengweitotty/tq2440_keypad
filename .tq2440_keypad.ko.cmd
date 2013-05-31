@@ -1,0 +1,1 @@
+cmd_/work/driver_program/tq2440_keypad/tq2440_keypad.ko := arm-linux-ld -EL -r   --build-id -o /work/driver_program/tq2440_keypad/tq2440_keypad.ko /work/driver_program/tq2440_keypad/tq2440_keypad.o /work/driver_program/tq2440_keypad/tq2440_keypad.mod.o
