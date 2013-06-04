@@ -15,10 +15,12 @@
 #include <linux/interrupt.h>    //use for probe_irq_on or probe_irq_off,request_irq,free_irq
 #include <asm/delay.h>  //use for udelay
 #include <mach/irqs.h>	//use for irq number
-#include <linux/sched.h>    //
+#include <linux/sched.h>    //use for schedule
+#include <linux/jiffies.h>	//using for jiffies
 #include <linux/input.h>	//use for EV_KEY KEY_1...
 #include <linux/platform_device.h>	//use for platform_driver
 
+/*
 #undef PDEBUG
 #ifdef KEYPAD_DEBUG
 	#ifdef __KERNEL__
@@ -29,6 +31,8 @@
 #else
 #define PDEBUG(fmt,args...)
 #endif
+*/
+#define PDEBUG(fmt,args...)	printk(KERN_INFO fmt,##args)
 
 #define KEYBASE	0x56000050
 #define GPFCON	0x56000050
@@ -36,6 +40,7 @@
 #define GPFUP	0x56000058
 
 #define NAME_SIZE	5
+#define DEBOUCE	100
 #define KEY_NUM	4
 #define STATE_IDLE 0
 #define STATE_RUN 1
@@ -47,19 +52,50 @@ struct tq2440_key{
 	int index;
 	char state;
 	char key_value;
+	unsigned long key_time;
 };
 
 struct tq2440_key *keypad;
 struct input_dev *input;
+struct tasklet_struct keypad_work;
 char keyval[4] = {KEY_1,KEY_2,KEY_3,KEY_4};
 int irqval[4] = {IRQ_EINT1,IRQ_EINT4,IRQ_EINT2,IRQ_EINT0};
 volatile unsigned long* gpfcon = NULL;
 volatile unsigned long* gpfdat = NULL;
 volatile unsigned long* gpfup = NULL;
 
+void keypad_do_work(unsigned long data){
+	struct tq2440_key* keytemp = (struct tq2440_key*)data;
+	input_report_key(input,EV_KEY,keytemp->key_value);
+	input_sync(input);
+	keytemp->key_time = jiffies;
+	PDEBUG("[tq2440_keypad/keypad_do_work]key interrupt occur %s\n",keytemp->name);
+
+}
 irqreturn_t key_interrupt(int irq,void* dev_id){
 	struct tq2440_key* keytemp = (struct tq2440_key*)dev_id;
-	PDEBUG("[tq2440_keypad/key_interrupt]key interrupt occur %s\n",keytemp->name);
+	unsigned long j0,j1;
+	/* debouce press key */
+	j0 = keytemp->key_time;
+	j1 = jiffies;
+	//tasklet_init(&keypad_work,(void (*)(unsigned long))keypad_do_work,(unsigned long)&keytemp);
+	if((j1 - j0)  > msecs_to_jiffies(DEBOUCE)){
+		//j1 = jiffies + msecs_to_jiffies(DEBOUCE);
+		//while(time_before(jiffies,j1)){
+		//	schedule();		
+		//}
+		//tasklet_schedule(&keypad_work);
+		//INIT_WORK(&keypad_work,(void (*)(void *))keypad_do_work,(void *)keytemp);
+		//schedule_work(&keypad_work);
+		keytemp->key_time = jiffies;
+		input_report_key(input,EV_KEY,keytemp->key_value);
+		input_sync(input);
+		PDEBUG("[tq2440_keypad/key_interrupt]key interrupt occur %s\n",keytemp->name);
+	}
+	//input_report_key(input,EV_KEY,keytemp->key_value);
+	//input_sync(input);
+	//PDEBUG("[tq2440_keypad/key_interrupt]key interrupt occur %s\n",keytemp->name);
+	
 	return IRQ_HANDLED;
 }
 
@@ -100,7 +136,8 @@ void key_setup(struct tq2440_key *keytemp,int irqtemp,int index,char keyvaltemp)
 	keytemp->index = index;
 	keytemp->state = STATE_IDLE;
 	keytemp->key_value = keyvaltemp;
-	PDEBUG("[tq2440_keypad/key_setup]setup key num %i",index);
+	keytemp->key_time = 0;
+	PDEBUG("[tq2440_keypad/key_setup]setup key num %i\n",index);
 }
 static int __devinit key_probe(struct platform_device *pdev){
 	int ret = 0;
@@ -116,15 +153,35 @@ static int __devinit key_probe(struct platform_device *pdev){
 	}
 	ret = hardware_init();
 	if(ret < 0){
-		PDEBUG("[tq2440_keypad/key_setup]hardware initialize may occur something wrong\n");
+		PDEBUG("[tq2440_keypad/key_probe]hardware initialize may occur something wrong\n");
 		goto failed1;		
 	}
 	for(index = 0;index < KEY_NUM;index++){
-		ret = request_irq(keypad[index].irq,key_interrupt,IRQF_DISABLED,keypad[index].name,(void*)&keypad[index]);
+		ret = request_irq(keypad[index].irq,key_interrupt,IRQF_DISABLED | IRQF_TRIGGER_FALLING,keypad[index].name,(void*)&keypad[index]);
 		if(ret != 0){
 			goto failed2;				
 		}
-		PDEBUG("[tq2440_keypad/key_setup]Success to request irq num %d\n",index);
+		PDEBUG("[tq2440_keypad/key_probe]Success to request irq num %d\n",index);
+	}
+	input = input_allocate_device();
+	if(!input){
+		PDEBUG("[tq2440_keypad/key_probe]Can not allocate input device\n");
+		ret = -ENOMEM;
+		goto failed2;
+	}
+	input->name = pdev->name;
+	input->id.bustype = BUS_HOST;
+	input->id.vendor = 0x0001;
+	input->id.product = 0x0001;
+	input->id.version = 0x0100;
+	for(index = 0;index < KEY_NUM;index++){
+		input_set_capability(input,EV_KEY,keypad[index].key_value);		
+	}
+	ret = input_register_device(input);
+	if(ret){
+		PDEBUG("[tq2440_keypad/key_probe]Can not allocate input device\n");
+		input_free_device(input);
+		goto failed2;
 	}
 	return ret;
 failed2:
@@ -141,9 +198,11 @@ static int __devexit key_remove(struct platform_device *pdev){
 	hardware_release();
 	for(index = 0;index < KEY_NUM;index++){
         PDEBUG("[tq2440_keypad/key_setup]Success to free irq num %d\n",index);
-		free_irq(keypad[index].irq,key_interrupt);
+		free_irq(keypad[index].irq,(void*)&keypad[index]);
 	}
 	kfree(keypad);
+	input_unregister_device(input);
+	input_free_device(input);
 	return 0;
 }
 
